@@ -135,7 +135,17 @@ impl Model {
                     return Ok(());
                 }
             }
-            MediaTypes::Radio(_radio_track_data) => (),
+            MediaTypes::Radio(radio_track_data) => {
+                // Radio tracks (m3u entries with an #EXTIMG: cover URL packed
+                // into the tmeta fragment) fetch their cover from HTTP. Use
+                // the same async fetcher as podcast since we're inside the
+                // tokio runtime here and `Track::get_picture` uses blocking
+                // reqwest which would conflict.
+                if let Some(url) = radio_track_data.cover_url() {
+                    let tx = self.tx_to_main.clone();
+                    Handle::current().spawn(Self::fetch_podcast_image(tx, url.to_string()));
+                }
+            }
             MediaTypes::Podcast(podcast_track_data) => {
                 let url = {
                     if let Some(episode_photo_url) = podcast_track_data.image_url() {

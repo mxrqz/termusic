@@ -79,7 +79,7 @@ impl Mpris {
             }
         };
 
-        let album = track.as_track().and_then(|v| v.album());
+        let album = track.album();
 
         self.controls
             .set_metadata(MediaMetadata {
