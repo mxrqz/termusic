@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
 use id3::frame::Lyrics as Id3Lyrics;
 use lofty::{
     config::ParseOptions,
@@ -225,16 +226,26 @@ impl Track {
     }
 
     /// Create a new Track from a radio url
+    ///
+    /// If the URL carries a `#tmeta=BASE64(...)` fragment produced by
+    /// `lib/src/playlist/m3u.rs` (#EXTINF preserving), the title/artist/
+    /// duration are extracted and the fragment is stripped from the URL.
     #[must_use]
     pub fn new_radio<U: Into<String>>(url: U) -> Self {
-        let radio_data = RadioTrackData { url: url.into() };
+        let url_string: String = url.into();
+        let (clean_url, meta) = extract_tmeta_fragment(&url_string);
+        let radio_data = RadioTrackData { url: clean_url };
+
+        let (title, artist, duration) = match meta {
+            Some(m) => (m.title, m.artist, m.duration_sec.map(Duration::from_secs)),
+            None => (None, None, None),
+        };
 
         Self {
             inner: MediaTypes::Radio(radio_data),
-            duration: None,
-            // will be fetched later, maybe consider storing a cache in the database?
-            title: None,
-            artist: None,
+            duration,
+            title,
+            artist,
         }
     }
 
@@ -510,6 +521,59 @@ impl Track {
             cache.pop(path);
         });
     }
+}
+
+/// Helper struct used by [`Track::new_radio`] to ferry m3u `#EXTINF`
+/// metadata that was packed into the URL fragment by
+/// `lib/src/playlist/m3u.rs`.
+struct TMeta {
+    title: Option<String>,
+    artist: Option<String>,
+    duration_sec: Option<u64>,
+}
+
+/// If `url_str` carries a `#tmeta=BASE64(title\tartist\tduration_secs)`
+/// fragment, decode it and return the URL with the fragment stripped
+/// alongside the parsed metadata. Otherwise return the URL unchanged
+/// and `None`.
+fn extract_tmeta_fragment(url_str: &str) -> (String, Option<TMeta>) {
+    let Ok(mut url) = reqwest::Url::parse(url_str) else {
+        return (url_str.to_string(), None);
+    };
+    let Some(fragment) = url.fragment().map(str::to_string) else {
+        return (url_str.to_string(), None);
+    };
+    let Some(b64) = fragment.strip_prefix("tmeta=") else {
+        return (url_str.to_string(), None);
+    };
+    let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64) else {
+        return (url_str.to_string(), None);
+    };
+    let Ok(decoded_str) = String::from_utf8(decoded) else {
+        return (url_str.to_string(), None);
+    };
+
+    let mut parts = decoded_str.splitn(3, '\t');
+    let title = parts
+        .next()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
+    let artist = parts
+        .next()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
+    let duration_sec = parts.next().and_then(|s| s.parse::<u64>().ok());
+
+    url.set_fragment(None);
+
+    (
+        url.to_string(),
+        Some(TMeta {
+            title,
+            artist,
+            duration_sec,
+        }),
+    )
 }
 
 impl PartialEq<PlaylistTrackSource> for &Track {
