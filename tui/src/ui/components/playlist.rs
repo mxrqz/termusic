@@ -645,10 +645,7 @@ impl Model {
             let mut title: Cow<'_, str> = track.title().map_or_else(|| track.id_str(), Into::into);
 
             let artist = track.artist().unwrap_or(UNKNOWN_ARTIST);
-            let album = track
-                .as_track()
-                .and_then(|v| v.album())
-                .unwrap_or(UNKNOWN_ALBUM);
+            let album = track.album().unwrap_or(UNKNOWN_ALBUM);
 
             // TODO: is there maybe a better option to do this on-demand instead of the whole playlist; like on draw-time?
             if Some(idx) == self.playback.playlist.current_track_index() {

@@ -93,6 +93,10 @@ impl PodcastTrackData {
 pub struct RadioTrackData {
     /// The Radio url, used as the sole identifier for equality
     url: String,
+    /// Album name for the entry, when known (e.g. from m3u EXTALB).
+    album: Option<String>,
+    /// HTTP(S) URL of a cover image to fetch on demand.
+    cover_url: Option<String>,
 }
 
 impl RadioTrackData {
@@ -102,12 +106,28 @@ impl RadioTrackData {
         &self.url
     }
 
+    /// Get the album name if known.
+    #[must_use]
+    pub fn album(&self) -> Option<&str> {
+        self.album.as_deref()
+    }
+
+    /// Get the cover image URL if known.
+    #[must_use]
+    pub fn cover_url(&self) -> Option<&str> {
+        self.cover_url.as_deref()
+    }
+
     /// Create new [`RadioTrackData`] with only the url.
     ///
     /// This should mainly be used for tests only.
     #[must_use]
     pub fn new(url: String) -> Self {
-        Self { url }
+        Self {
+            url,
+            album: None,
+            cover_url: None,
+        }
     }
 }
 
@@ -175,11 +195,15 @@ pub struct LyricData {
 
 type PictureCache = LruCache<PathBuf, Arc<Picture>>;
 type LyricCache = LruCache<PathBuf, Arc<LyricData>>;
+/// Radio cover cache: HTTP-fetched album art keyed by image URL.
+/// Separate from `PICTURE_CACHE` because that one is keyed by file path.
+type UrlPictureCache = LruCache<String, Arc<Picture>>;
 
 // NOTE: thread_locals are like "LazyLock"s, they only get initialized on first access.
 std::thread_local! {
     static PICTURE_CACHE: RefCell<PictureCache> = RefCell::new(PictureCache::new(NonZeroUsize::new(5).unwrap()));
     static LYRIC_CACHE: RefCell<LyricCache> = RefCell::new(LyricCache::new(NonZeroUsize::new(5).unwrap()));
+    static URL_PICTURE_CACHE: RefCell<UrlPictureCache> = RefCell::new(UrlPictureCache::new(NonZeroUsize::new(16).unwrap()));
 }
 
 #[derive(Debug, Clone)]
@@ -228,17 +252,30 @@ impl Track {
     /// Create a new Track from a radio url
     ///
     /// If the URL carries a `#tmeta=BASE64(...)` fragment produced by
-    /// `lib/src/playlist/m3u.rs` (#EXTINF preserving), the title/artist/
-    /// duration are extracted and the fragment is stripped from the URL.
+    /// `lib/src/playlist/m3u.rs` (#EXTINF + #EXTALB + #EXTIMG preserving),
+    /// the title/artist/duration/album/cover_url are extracted and stored
+    /// on both the Track and the RadioTrackData. The fragment is kept in
+    /// the stored URL so that persisted playlists round-trip on reload.
     #[must_use]
     pub fn new_radio<U: Into<String>>(url: U) -> Self {
         let url_string: String = url.into();
-        let (clean_url, meta) = extract_tmeta_fragment(&url_string);
-        let radio_data = RadioTrackData { url: clean_url };
+        let (stored_url, meta) = extract_tmeta_fragment(&url_string);
 
-        let (title, artist, duration) = match meta {
-            Some(m) => (m.title, m.artist, m.duration_sec.map(Duration::from_secs)),
-            None => (None, None, None),
+        let (title, artist, duration, album, cover_url) = match meta {
+            Some(m) => (
+                m.title,
+                m.artist,
+                m.duration_sec.map(Duration::from_secs),
+                m.album,
+                m.cover_url,
+            ),
+            None => (None, None, None, None, None),
+        };
+
+        let radio_data = RadioTrackData {
+            url: stored_url,
+            album,
+            cover_url,
         };
 
         Self {
@@ -307,6 +344,21 @@ impl Track {
     #[must_use]
     pub fn duration(&self) -> Option<Duration> {
         self.duration
+    }
+
+    /// Get the album name regardless of media type.
+    ///
+    /// Returns the album for local Tracks (from file metadata) and for
+    /// Radio tracks that were created with an album hint (e.g. from m3u
+    /// `#EXTALB:` propagated via the URL fragment). Podcasts have no
+    /// album concept.
+    #[must_use]
+    pub fn album(&self) -> Option<&str> {
+        match &self.inner {
+            MediaTypes::Track(t) => t.album(),
+            MediaTypes::Radio(r) => r.album(),
+            MediaTypes::Podcast(_) => None,
+        }
     }
 
     /// Format the Track's duration to a short-form.
@@ -445,7 +497,28 @@ impl Track {
                     Err(Some(err)) => return Err(err),
                 }
             }
-            MediaTypes::Radio(_radio_track_data) => trace!("Unimplemented: radio picture"),
+            MediaTypes::Radio(radio_track_data) => {
+                let Some(cover_url) = radio_track_data.cover_url() else {
+                    return Ok(None);
+                };
+                let key = cover_url.to_string();
+                let res = URL_PICTURE_CACHE.with_borrow_mut(|cache| {
+                    cache
+                        .try_get_or_insert(key, || {
+                            let picture = fetch_picture_from_url(cover_url).map_err(Some)?;
+                            let Some(picture) = picture else {
+                                return Err(None);
+                            };
+                            Ok(Arc::new(picture))
+                        })
+                        .cloned()
+                });
+                match res {
+                    Ok(v) => return Ok(Some(v)),
+                    Err(None) => return Ok(None),
+                    Err(Some(err)) => return Err(err),
+                }
+            }
             MediaTypes::Podcast(_podcast_track_data) => trace!("Unimplemented: podcast picture"),
         }
 
@@ -530,15 +603,20 @@ struct TMeta {
     title: Option<String>,
     artist: Option<String>,
     duration_sec: Option<u64>,
+    album: Option<String>,
+    cover_url: Option<String>,
 }
 
-/// If `url_str` carries a `#tmeta=BASE64(title\tartist\tduration_secs)`
+/// If `url_str` carries a `#tmeta=BASE64(title\tartist\tduration_secs\talbum\tcover_url)`
 /// fragment, decode it and return the URL alongside the parsed metadata.
 /// The fragment is intentionally **kept** in the returned URL so that
 /// when termusic persists the playlist (which serializes the radio URL
 /// only, not the Track's title/artist/duration fields) the next session
 /// can re-parse the same fragment instead of showing "Unknown Artist".
 /// HTTP servers ignore fragments so streaming is not affected.
+///
+/// Older fragments with only 3 fields (title/artist/duration) still parse
+/// — album and cover_url just come back as None.
 fn extract_tmeta_fragment(url_str: &str) -> (String, Option<TMeta>) {
     let Ok(url) = reqwest::Url::parse(url_str) else {
         return (url_str.to_string(), None);
@@ -556,7 +634,7 @@ fn extract_tmeta_fragment(url_str: &str) -> (String, Option<TMeta>) {
         return (url_str.to_string(), None);
     };
 
-    let mut parts = decoded_str.splitn(3, '\t');
+    let mut parts = decoded_str.splitn(5, '\t');
     let title = parts
         .next()
         .map(str::to_string)
@@ -565,7 +643,17 @@ fn extract_tmeta_fragment(url_str: &str) -> (String, Option<TMeta>) {
         .next()
         .map(str::to_string)
         .filter(|s| !s.is_empty());
-    let duration_sec = parts.next().and_then(|s| s.parse::<u64>().ok());
+    let duration_sec = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok());
+    let album = parts
+        .next()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
+    let cover_url = parts
+        .next()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
 
     (
         url_str.to_string(),
@@ -573,6 +661,8 @@ fn extract_tmeta_fragment(url_str: &str) -> (String, Option<TMeta>) {
             title,
             artist,
             duration_sec,
+            album,
+            cover_url,
         }),
     )
 }
@@ -598,6 +688,37 @@ impl PartialEq<PlaylistTrackSource> for &Track {
 /// - if reading the file fails
 /// - if parsing the file fails
 /// - also see [`find_folder_picture`]
+/// Fetch a cover image from an HTTP(S) URL and decode it into a [`Picture`].
+///
+/// Uses the blocking reqwest client (sync API), so callers must run from
+/// outside an async runtime — which is fine for the `Track::get_picture`
+/// entry point.
+///
+/// # Errors
+///
+/// - if the request fails (network, non-2xx status, timeout)
+/// - if the body bytes cannot be parsed as an image by lofty
+fn fetch_picture_from_url(url: &str) -> Result<Option<Picture>> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("building reqwest blocking client")?
+        .get(url)
+        .send()
+        .with_context(|| format!("fetching cover {url}"))?
+        .error_for_status()
+        .with_context(|| format!("cover request status for {url}"))?;
+    let bytes = response
+        .bytes()
+        .with_context(|| format!("reading cover body for {url}"))?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let picture = Picture::from_reader(&mut std::io::Cursor::new(bytes.as_ref()))
+        .with_context(|| format!("decoding cover for {url}"))?;
+    Ok(Some(picture))
+}
+
 fn get_picture_for_music_track(track_path: &Path) -> Result<Option<Picture>> {
     let result = parse_metadata_from_file(
         track_path,

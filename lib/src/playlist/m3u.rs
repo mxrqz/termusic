@@ -30,7 +30,34 @@ pub fn decode(content: &str) -> Vec<M3UItem> {
         }
 
         if let Some(rest) = line.strip_prefix("#EXTINF:") {
-            pending_meta = Some(parse_extinf(rest));
+            // Preserve any album/cover already accumulated from previous
+            // #EXTALB / #EXTIMG directives that may have appeared before
+            // #EXTINF for the same entry.
+            let prev = pending_meta.take().unwrap_or_default();
+            let mut meta = parse_extinf(rest);
+            meta.album = meta.album.or(prev.album);
+            meta.cover_url = meta.cover_url.or(prev.cover_url);
+            pending_meta = Some(meta);
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("#EXTALB:") {
+            let value = rest.trim();
+            if !value.is_empty() {
+                let mut meta = pending_meta.take().unwrap_or_default();
+                meta.album = Some(value.to_string());
+                pending_meta = Some(meta);
+            }
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("#EXTIMG:") {
+            let value = rest.trim();
+            if !value.is_empty() {
+                let mut meta = pending_meta.take().unwrap_or_default();
+                meta.cover_url = Some(value.to_string());
+                pending_meta = Some(meta);
+            }
             continue;
         }
 
@@ -66,6 +93,8 @@ struct ExtInfMeta {
     duration_sec: Option<i64>,
     title: Option<String>,
     artist: Option<String>,
+    album: Option<String>,
+    cover_url: Option<String>,
 }
 
 /// Parse the body of an `#EXTINF:` line.
@@ -93,24 +122,34 @@ fn parse_extinf(rest: &str) -> ExtInfMeta {
         duration_sec,
         title,
         artist,
+        album: None,
+        cover_url: None,
     }
 }
 
 impl ExtInfMeta {
-    /// Pack metadata into the URL fragment as `tmeta=BASE64(tab-separated)`
-    /// so [`Track::new_radio`] can recover it. Empty fields are kept as
-    /// empty strings to preserve column positions.
+    /// Pack metadata into the URL fragment as
+    /// `tmeta=BASE64(title\tartist\tduration_sec\talbum\tcover_url)`
+    /// so [`Track::new_radio`] can recover it. Empty fields are kept
+    /// as empty strings to preserve column positions.
     fn attach_to_url(&self, url: &mut reqwest::Url) {
-        if self.title.is_none() && self.artist.is_none() && self.duration_sec.is_none() {
+        if self.title.is_none()
+            && self.artist.is_none()
+            && self.duration_sec.is_none()
+            && self.album.is_none()
+            && self.cover_url.is_none()
+        {
             return;
         }
         let line = format!(
-            "{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}",
             self.title.as_deref().unwrap_or(""),
             self.artist.as_deref().unwrap_or(""),
             self.duration_sec
                 .map(|d| d.to_string())
                 .unwrap_or_default(),
+            self.album.as_deref().unwrap_or(""),
+            self.cover_url.as_deref().unwrap_or(""),
         );
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(line.as_bytes());
         url.set_fragment(Some(&format!("tmeta={b64}")));
