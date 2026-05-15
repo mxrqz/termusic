@@ -533,14 +533,17 @@ struct TMeta {
 }
 
 /// If `url_str` carries a `#tmeta=BASE64(title\tartist\tduration_secs)`
-/// fragment, decode it and return the URL with the fragment stripped
-/// alongside the parsed metadata. Otherwise return the URL unchanged
-/// and `None`.
+/// fragment, decode it and return the URL alongside the parsed metadata.
+/// The fragment is intentionally **kept** in the returned URL so that
+/// when termusic persists the playlist (which serializes the radio URL
+/// only, not the Track's title/artist/duration fields) the next session
+/// can re-parse the same fragment instead of showing "Unknown Artist".
+/// HTTP servers ignore fragments so streaming is not affected.
 fn extract_tmeta_fragment(url_str: &str) -> (String, Option<TMeta>) {
-    let Ok(mut url) = reqwest::Url::parse(url_str) else {
+    let Ok(url) = reqwest::Url::parse(url_str) else {
         return (url_str.to_string(), None);
     };
-    let Some(fragment) = url.fragment().map(str::to_string) else {
+    let Some(fragment) = url.fragment() else {
         return (url_str.to_string(), None);
     };
     let Some(b64) = fragment.strip_prefix("tmeta=") else {
@@ -564,10 +567,8 @@ fn extract_tmeta_fragment(url_str: &str) -> (String, Option<TMeta>) {
         .filter(|s| !s.is_empty());
     let duration_sec = parts.next().and_then(|s| s.parse::<u64>().ok());
 
-    url.set_fragment(None);
-
     (
-        url.to_string(),
+        url_str.to_string(),
         Some(TMeta {
             title,
             artist,
