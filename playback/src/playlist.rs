@@ -163,9 +163,15 @@ impl Playlist {
 
         Self::check_same_source(&info.id, track_at_idx.inner(), new_index)?;
 
+        // Just queue the index; the caller (`server.rs` PlaylistPlaySpecific
+        // handler) immediately runs `player.next()` afterwards, which consumes
+        // `next_track_index` and triggers `skip_one`. Previously this also
+        // ran `self.next(true)` internally, so the caller's subsequent
+        // `player.next()` advanced *again* via `next_index_loopmode` and the
+        // wrong (N+1) track played — the classic upstream off-by-one when
+        // pressing `l` / Enter on a Playlist row.
         self.next_track_index = Some(new_index);
-
-        Ok(self.next(true))
+        Ok(self.tracks.get(new_index))
     }
 
     /// Get the next track to play in this playlist.
